@@ -26,11 +26,19 @@ from dotenv import load_dotenv
 # Load .env if present
 load_dotenv()
 
+import random
+import threading
+
 logger = logging.getLogger("promo_finder.llm")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = REPO_ROOT / ".cache" / "llm"
 USAGE_LOG_PATH = Path(os.getenv("USAGE_LOG_PATH", str(REPO_ROOT / "outputs" / "usage.jsonl")))
+_usage_lock = threading.Lock()
+_rate_limit_lock = threading.Lock()
+_last_call_time = 0.0
+# Minimum seconds between outgoing API calls across all threads (protects against Vertex AI 15 RPM quota)
+_MIN_CALL_INTERVAL = 3.6
 
 
 def _get_cache_key(
@@ -70,8 +78,9 @@ def _log_usage(
         "duration_sec": round(duration_sec, 3),
     }
     try:
-        with open(USAGE_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
+        with _usage_lock:
+            with open(USAGE_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
     except OSError as err:
         logger.warning("Failed to write usage log: %s", err)
 
@@ -116,7 +125,7 @@ class LLMClient:
         temperature: float = 0.2,
         use_cache: bool = True,
         label: str = "general",
-        max_retries: int = 4,
+        max_retries: int = 6,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Generate structured JSON from prompt.
         
@@ -151,11 +160,20 @@ class LLMClient:
         prompt_tokens = 0
         candidates_tokens = 0
 
-        delay = 2.0
+        delay = 3.0
         last_error: Exception | None = None
 
         for attempt in range(max_retries):
             try:
+                # Thread-safe rate limiter to strictly observe RPM bounds
+                with _rate_limit_lock:
+                    global _last_call_time
+                    now = time.time()
+                    elapsed = now - _last_call_time
+                    if elapsed < _MIN_CALL_INTERVAL:
+                        time.sleep(_MIN_CALL_INTERVAL - elapsed)
+                    _last_call_time = time.time()
+
                 if self.provider == "vertex":
                     result_json, prompt_tokens, candidates_tokens = self._call_vertex(
                         prompt=prompt,
@@ -173,15 +191,20 @@ class LLMClient:
                 break
             except Exception as err:
                 last_error = err
+                err_str = str(err)
+                # If rate limited (429), back off with jitter
+                wait_time = delay + random.uniform(1.0, 3.0)
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    wait_time = max(delay, 5.0) + random.uniform(2.0, 5.0)
                 logger.warning(
                     "LLM call attempt %d failed: %s. Retrying in %.1fs...",
                     attempt + 1,
                     err,
-                    delay,
+                    wait_time,
                 )
                 if attempt == max_retries - 1:
                     raise RuntimeError(f"LLM call failed after {max_retries} attempts: {err}") from err
-                time.sleep(delay)
+                time.sleep(wait_time)
                 delay *= 2.0
 
         duration = time.time() - start_time

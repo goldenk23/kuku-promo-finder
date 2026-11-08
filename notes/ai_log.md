@@ -31,7 +31,17 @@ Documenting concrete mistakes made by AI models (both development assistants and
    - *Evidence*: `RuleValidator` rejected 3 candidate promos under `duration_out_of_bounds`.
    - *Resolution*: Rule validator rejected the invalid duration clips rather than allowing bad clips through.
 
-4. **Vertex AI Free-Tier 429 Rate Limiting**:
-   - *Error*: Rapid sequential calls for cold-viewer evaluation overwhelmed the per-minute quota on the trial key.
-   - *Evidence*: `429 RESOURCE_EXHAUSTED` returned by Vertex AI.
-   - *Resolution*: Implemented jittered exponential backoff and pacing in `llm.py`.
+4. **Vertex AI Free-Tier 429 Rate Limiting & Multi-Threaded Deadlock**:
+   - *Error*: Rapid concurrent calls across worker threads for cold-viewer evaluation overwhelmed the 15 RPM quota on the Vertex AI trial key, causing threads to retry at synchronized intervals and collide repeatedly.
+   - *Evidence*: Repeated `429 RESOURCE_EXHAUSTED` in worker logs with escalating backoffs.
+   - *Resolution*: Implemented thread-safe interval rate limiting (`_rate_limit_lock` enforcing `_MIN_CALL_INTERVAL = 3.6s`) and randomized jitter on backoff in `llm.py`, eliminating 429 collisions and achieving steady throughput.
+
+## Chunk 3: Ranking & Quality Assurance
+
+1. **Adversarial Calibration Verification**:
+   - *Test*: Ran 5 defective synthetic probe clips through the Cold-Viewer Judge (passive camera, premature cut, mid-sentence cut, zero-stakes monologue, disjointed scenes).
+   - *Outcome*: Judge appropriately identified the defects and scored them 1/5 and 2/5 on hook and cliffhanger strength, demonstrating that the evaluation prompt is discriminatory and does not hallucinate high scores for low-quality content.
+
+2. **Deduplication Thresholding**:
+   - *Observation*: High-conflict episodes (e.g. climax episodes) produced multiple candidate clips that shared 70-90% of the same dialogue events.
+   - *Resolution*: Temporal deduplication with an Intersection-over-Union (IoU) threshold of >50% successfully pruned duplicate cuts, retaining only the highest-scoring variation and preserving variety in the final 15-promo package.

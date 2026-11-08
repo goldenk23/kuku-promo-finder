@@ -44,3 +44,21 @@
 - **Cold-Viewer Judge Architecture**:
   - *Decision*: A dedicated LLM call sees ONLY the promo's own dialogue and actions without series context or loglines. Evaluates hook stopping power (1-5), cliffhanger tension (1-5), and standalone clarity (1-5).
   - *Why*: Directly simulates a scrolling stranger encountering the ad on TikTok or Instagram Reels.
+
+## Chunk 3: Ranking, Quality Assurance & Full Run
+
+- **Composite Scoring Formula**:
+  - *Formula*: `score = 0.40 * clarity + 0.35 * hook + 0.25 * cliffhanger + 0.25 * cross_bonus`
+  - *Why*: In performance marketing for microdramas, clarity is paramount (0.40). If a viewer cannot understand who is who in the first 5 seconds, they swipe away immediately regardless of the cliffhanger. Hook is weighted 0.35 to guarantee top-of-funnel scroll stopping, and cliffhanger is 0.25 to drive the install. A small bonus (+0.25) is awarded to cross-episode arcs for their higher editorial complexity.
+
+- **Temporal Deduplication & Diversity Constraint**:
+  - *Decision*: Promos sharing >50% temporal overlap (Intersection-over-Union of active timestamps) are deduplicated, keeping only the highest-scoring cut. Furthermore, a maximum of 2 promos per scene are permitted in the top 10.
+  - *Why*: Prevents ranking tables from filling up with 5 slight variations of the same viral scene.
+
+- **Adversarial Quality Benchmark**:
+  - *Decision*: Five synthetic probe clips (passive camera pans, premature cuts, mid-sentence dialogue cuts, low-stakes monologues, out-of-order stitching) are passed to the judge to verify calibration.
+  - *Why*: Protects against LLM judge "grade inflation" and verifies the model detects weak dramatic structure.
+
+- **Thread-Safe Rate Limiting**:
+  - *Decision*: Implemented `_rate_limit_lock` and a minimum 3.6s call interval across threads in `promo_finder/llm.py`.
+  - *Why*: Prevents free-tier Vertex AI 429 quota exhaustion during multi-threaded batch judging.
