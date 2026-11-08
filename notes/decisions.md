@@ -26,3 +26,21 @@
 - **Usage Auditing**:
   - *Decision*: Every LLM call records prompt tokens, candidate tokens, duration, and cache hit status to `outputs/usage.jsonl`.
   - *Why*: Accurately tracks per-show cost without manual estimation.
+
+## Chunk 2: Promo Finder (Candidates, Rule Validation, Cold-Viewer Judge)
+
+- **Compact Transcript Design**:
+  - *Decision*: Render events compactly as `[E01-S01-001 00:00.00-00:04.80] KIND SPEAKER: text`, truncating lengthy camera descriptions to 70 chars.
+  - *Why*: Keeps prompt tokens low (~1,000 tokens per episode) while providing exact IDs and time bounds to the model.
+
+- **Two-Pass Candidate Generation (Pass A + Pass B)**:
+  - *Decision*: Pass A extracts up to 4 promos per individual episode. Pass B synthesizes cross-episode arcs (combining betrayal in Ep 1 with confrontation in later episodes).
+  - *Why*: Covers both single-episode self-contained clips and high-converting cross-episode arcs without overwhelming context limits.
+
+- **Strict Code-Enforced Rule Validation with Whole-Event Repairs**:
+  - *Decision*: Validate candidates purely in Python (`RuleValidator`). If duration or hook is slightly off, attempt whole-event trimming/extending without cutting dialogue mid-sentence. Reject candidates that violate non-negotiables (unknown IDs, duration <20s or >60s after repair, misplaced cliffhanger).
+  - *Why*: Editorial integrity; no promo is published with invalid cuts or hallucinated IDs.
+
+- **Cold-Viewer Judge Architecture**:
+  - *Decision*: A dedicated LLM call sees ONLY the promo's own dialogue and actions without series context or loglines. Evaluates hook stopping power (1-5), cliffhanger tension (1-5), and standalone clarity (1-5).
+  - *Why*: Directly simulates a scrolling stranger encountering the ad on TikTok or Instagram Reels.

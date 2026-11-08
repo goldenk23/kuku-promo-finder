@@ -99,11 +99,13 @@ class LLMClient:
         # Initialize Google GenAI client for Vertex AI
         kwargs: dict[str, Any] = {"vertexai": True}
         if self.api_key:
+            # When API key is provided, project/location are mutually exclusive
             kwargs["api_key"] = self.api_key
-        if self.project:
-            kwargs["project"] = self.project
-        if self.location:
-            kwargs["location"] = self.location
+        else:
+            if self.project:
+                kwargs["project"] = self.project
+            if self.location:
+                kwargs["location"] = self.location
         self._genai_client = genai.Client(**kwargs)
 
     def generate_json(
