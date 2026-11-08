@@ -1,0 +1,26 @@
+# Environment and secrets
+.env
+*.env
+
+# Data and outputs (confidential / raw outputs)
+data/
+outputs/
+*.zip
+
+# Cache and temporary
+.cache/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
