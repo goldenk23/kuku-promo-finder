@@ -23,14 +23,9 @@ from dotenv import load_dotenv
 # Load env variables
 load_dotenv()
 
-from promo_finder.finder import (
-    generate_cross_episode_candidates,
-    generate_single_episode_candidates,
-    judge_cold_viewer,
-)
-from promo_finder.parse import Episode, format_timestamp, load_episodes
-from promo_finder.rank import compute_promo_score, rank_and_deduplicate_promos
-from promo_finder.validate import RuleValidator, ValidatedPromo
+from promo_finder.finder import run_pipeline
+from promo_finder.parse import format_timestamp, load_episodes
+from promo_finder.rank import rank_and_deduplicate_promos
 
 st.set_page_config(
     page_title="Kuku Promo Finder",
@@ -107,84 +102,22 @@ if st.button("🚀 Find Best Promos", type="primary", disabled=input_source is N
 
         st.info(f"Loaded {len(episodes)} episodes ({sum(len(ep.events) for ep in episodes):,} events).")
 
-        validator = RuleValidator(episodes)
-        events_by_id = validator.events_by_id
+        # Same pipeline as the CLI; progress lines are shown as they arrive.
+        log_lines: list[str] = []
 
-        raw_candidates = []
-        validated_promos = []
-        rejections = []
-        dramatic_moments = []
+        def show_progress(msg: str) -> None:
+            log_lines.append(msg)
+            status_text.code("\n".join(log_lines[-12:]))
+            progress_bar.progress(min(95, len(log_lines)) / 100, text=msg.strip()[:80])
 
-        # Pass A: Single Episode Candidates
-        total_steps = len(episodes) + (1 if len(episodes) >= 2 else 0) + 1
-        current_step = 0
-
-        for ep in episodes:
-            current_step += 1
-            progress_bar.progress(int((current_step / total_steps) * 40), text=f"Pass A: Analyzing Episode {ep.number}...")
-            cands = generate_single_episode_candidates(ep, max_candidates=4, use_cache=use_cache)
-
-            for c_idx, c in enumerate(cands, 1):
-                if not c.get("promo_id"):
-                    c["promo_id"] = f"E{ep.number:02d}-P{c_idx}"
-                c["pass"] = "pass_a"
-                raw_candidates.append(c)
-                val_res = validator.validate_candidate(c)
-                if val_res.is_valid and val_res.promo:
-                    promo = val_res.promo
-                    for seg in promo.segments:
-                        for ev in seg.events:
-                            if ev.kind == "dialogue":
-                                dramatic_moments.append({
-                                    "event_id": ev.id,
-                                    "episode": ev.episode,
-                                    "kind": ev.kind,
-                                    "text": f"{ev.speaker}: {ev.text}",
-                                })
-                    validated_promos.append({"promo": promo, "validation_repairs": promo.repairs_applied})
-                else:
-                    rejections.append({"candidate": c, "rule": val_res.rejection_rule, "reason": val_res.rejection_reason})
-
-        # Pass B: Cross-Episode
-        if len(episodes) >= 2:
-            current_step += 1
-            progress_bar.progress(50, text="Pass B: Identifying cross-episode narrative arcs...")
-            cross_cands = generate_cross_episode_candidates(episodes, dramatic_moments, max_candidates=8, use_cache=use_cache)
-            for c_idx, c in enumerate(cross_cands, 1):
-                if not c.get("promo_id"):
-                    c["promo_id"] = f"CROSS-P{c_idx}"
-                c["pass"] = "pass_b"
-                raw_candidates.append(c)
-                val_res = validator.validate_candidate(c)
-                if val_res.is_valid and val_res.promo:
-                    validated_promos.append({"promo": val_res.promo, "validation_repairs": val_res.promo.repairs_applied})
-                else:
-                    rejections.append({"candidate": c, "rule": val_res.rejection_rule, "reason": val_res.rejection_reason})
-
-        # Judging
-        progress_bar.progress(60, text=f"Cold-Viewer Judge: Simulating first-time viewers ({len(validated_promos)} clips)...")
-        evaluated_promos = []
-        for idx, item in enumerate(validated_promos, 1):
-            p = item["promo"]
-            pct = 60 + int((idx / max(1, len(validated_promos))) * 30)
-            progress_bar.progress(min(90, pct), text=f"Judging promo {idx}/{len(validated_promos)} ({p.promo_id})...")
-            try:
-                j_res = judge_cold_viewer(p, use_cache=use_cache)
-            except Exception:
-                j_res = {"hook_strength": 3, "cliffhanger_strength": 3, "standalone_clarity": 3, "summary": "N/A", "open_question": "N/A"}
-            p_dict = p.to_dict()
-            p_dict["judge"] = j_res
-            p_dict["validation_repairs"] = item["validation_repairs"]
-            evaluated_promos.append(p_dict)
-
-        # Ranking
-        progress_bar.progress(95, text="Ranking and selecting top promos...")
-        ranked = rank_and_deduplicate_promos(evaluated_promos, top_n=top_n_promos)
+        result = run_pipeline(episodes, workers=3, use_cache=use_cache, progress=show_progress)
+        ranked = rank_and_deduplicate_promos(result["evaluated"], top_n=top_n_promos)
 
         progress_bar.progress(100, text="Done!")
         st.session_state["ranked_promos"] = ranked
-        st.session_state["rejections_count"] = len(rejections)
-        st.session_state["raw_count"] = len(raw_candidates)
+        st.session_state["episodes_by_num"] = {ep.number: ep for ep in episodes}
+        st.session_state["rejections_count"] = len(result["rejections"])
+        st.session_state["raw_count"] = len(result["raw_candidates"])
 
     except Exception as exc:
         st.error(f"Pipeline error: {exc}")
@@ -220,7 +153,9 @@ if "ranked_promos" in st.session_state:
     for p in ranked:
         j = p.get("judge", {})
         with st.expander(f"Rank #{p['rank']}: {p['promo_id']} (Duration: {p['total_duration']}s | Score: {p['score']:.2f})"):
-            st.markdown(f"**Editorial Rationale**: {p['reason']}")
+            st.markdown(f"**Hook**: {p.get('hook_text', '')}")
+            st.markdown(f"**Cliffhanger**: {p.get('cliffhanger_text', '')}")
+            st.markdown(f"**Why it works**: {p['reason']}")
             if p.get("post_first_note"):
                 st.info(f"**Why Post First**: {p['post_first_note']}")
 
@@ -235,11 +170,11 @@ if "ranked_promos" in st.session_state:
             st.markdown("#### Segment Timeline & Script Breakdown")
             for seg in p["segments"]:
                 st.markdown(f"**Episode {seg['episode']}** (`{seg['start_ts']}` – `{seg['end_ts']}`, {seg['duration']}s):")
-                # Show events inside segment
-                if "events" in seg:
-                    for ev in seg["events"]:
-                        spk = ev.get("speaker") or "ACTION"
-                        st.markdown(f"- `[{ev.get('start_ts', '')}]` **{spk}**: {ev.get('text', '')}")
+                ep = st.session_state.get("episodes_by_num", {}).get(seg["episode"])
+                if ep:
+                    for ev in ep.events:
+                        if ev.kind != "camera" and seg["start"] - 0.01 <= ev.start < seg["end"]:
+                            st.markdown(f"- `[{format_timestamp(ev.start)}]` {ev.line()}")
 
     # Export downloads
     st.subheader("💾 Export Deliverables")
@@ -251,7 +186,10 @@ if "ranked_promos" in st.session_state:
     # CSV export
     csv_buf = io.StringIO()
     if ranked:
-        writer = csv.DictWriter(csv_buf, fieldnames=["rank", "promo_id", "score", "total_duration", "reason", "is_cross_episode"])
+        writer = csv.DictWriter(csv_buf, fieldnames=[
+            "rank", "promo_id", "score", "total_duration", "segments", "hook_text", "cliffhanger_text",
+            "reason", "is_cross_episode", "post_first_note",
+        ])
         writer.writeheader()
         for p in ranked:
             writer.writerow({
@@ -259,8 +197,12 @@ if "ranked_promos" in st.session_state:
                 "promo_id": p["promo_id"],
                 "score": p["score"],
                 "total_duration": p["total_duration"],
+                "segments": "; ".join(f"Ep {s['episode']} [{s['start_ts']} - {s['end_ts']}]" for s in p["segments"]),
+                "hook_text": p.get("hook_text", ""),
+                "cliffhanger_text": p.get("cliffhanger_text", ""),
                 "reason": p["reason"],
                 "is_cross_episode": p["is_cross_episode"],
+                "post_first_note": p.get("post_first_note", ""),
             })
     d2.download_button("Download CSV", csv_buf.getvalue(), file_name="kuku_top_promos.csv", mime="text/csv")
 
@@ -268,5 +210,10 @@ if "ranked_promos" in st.session_state:
     md_buf = ["# Top Ranked Promos\n"]
     for p in ranked:
         md_buf.append(f"## #{p['rank']} - {p['promo_id']} ({p['total_duration']}s, Score {p['score']:.2f})\n")
-        md_buf.append(f"- Reason: {p['reason']}\n")
+        for s in p["segments"]:
+            md_buf.append(f"- Episode {s['episode']}: {s['start_ts']} - {s['end_ts']}\n")
+        md_buf.append(f"- Hook: {p.get('hook_text', '')}\n")
+        md_buf.append(f"- Cliffhanger: {p.get('cliffhanger_text', '')}\n")
+        md_buf.append(f"- Why it works: {p['reason']}\n")
+        md_buf.append(f"- Post first: {p.get('post_first_note', '')}\n")
     d3.download_button("Download Markdown", "\n".join(md_buf), file_name="kuku_top_promos.md", mime="text/markdown")

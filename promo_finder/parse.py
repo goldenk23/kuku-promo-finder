@@ -58,6 +58,12 @@ class Event:
     def duration(self) -> float:
         return max(0.0, self.end - self.start)
 
+    def line(self) -> str:
+        """Human-readable one-liner, e.g. 'MATRIARCH: Not anymore.' or '[ACTION] She slaps him.'"""
+        if self.kind == "dialogue":
+            return f"{self.speaker or 'SPEAKER'}: {self.text}"
+        return f"[{self.kind.upper()}] {self.text}"
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -244,9 +250,9 @@ def parse_episode_text(text: str, filename: str = "<memory>") -> Episode:
                         speaker: str | None = None
                         emotion: str | None = None
 
-                        if raw_tag == "CAMERA":
+                        if raw_tag.upper() == "CAMERA":
                             kind = "camera"
-                        elif raw_tag == "ACTION":
+                        elif raw_tag.upper() == "ACTION":
                             kind = "action"
                         elif any(s in raw_tag.upper() for s in ["SOUND", "SFX", "MUSIC", "AUDIO"]):
                             kind = "other"

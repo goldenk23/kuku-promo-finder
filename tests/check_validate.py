@@ -150,9 +150,26 @@ def test_validator_rules() -> None:
         "reason": "Short promo",
     }
     res = validator.validate_candidate(cand_short)
-    # Note: attempts extension, but if not enough events or exceeds, check bounds
-    assert not res.is_valid or res.promo.total_duration >= 20.0
-    print("  -> Passed: duration bounds handling.")
+    # Extending to 20s would run 10s past the cliffhanger (limit is 4s), so it must be rejected, not padded.
+    assert not res.is_valid and res.rejection_rule == "duration_out_of_bounds", res
+    print("  -> Passed: short promo is not padded past its cliffhanger.")
+
+    # 6b. Mid-line cut: a camera shot ends at 25s while a line runs 24-27s; the cut must move to 27s.
+    cam = Event("E03-S01-001", 3, 1, "camera", None, None, 0.0, 25.0, "Wide shot")
+    line = Event("E03-S01-002", 3, 1, "dialogue", "CAROL", None, 24.0, 27.0, "You lied to me")
+    ep3 = Episode(number=3, logline="", continuity="", scenes=[], events=[cam, line])
+    v3 = RuleValidator([ep3])
+    res = v3.validate_candidate({
+        "promo_id": "P006B",
+        "segments": [{"start_event_id": cam.id, "end_event_id": cam.id}],
+        "hook_event_id": cam.id,
+        "cliffhanger_event_id": cam.id,
+        "reason": "Mid-line cut",
+    })
+    assert res.is_valid, res
+    assert res.promo.total_duration == 27.0, res.promo.total_duration
+    assert res.promo.segments[0].end_event_id == line.id
+    print("  -> Passed: cut widened so no line is cut mid-sentence.")
 
     # 7. Cliffhanger misplaced (after end)
     cand_cliff = {

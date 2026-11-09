@@ -62,6 +62,8 @@ class ValidatedPromo:
     hook_offset: float  # seconds from promo start to hook start
     is_cross_episode: bool
     repairs_applied: list[str] = field(default_factory=list)
+    hook_text: str = ""
+    cliffhanger_text: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -70,7 +72,9 @@ class ValidatedPromo:
             "hook_offset": round(self.hook_offset, 2),
             "is_cross_episode": self.is_cross_episode,
             "hook_event_id": self.hook_event_id,
+            "hook_text": self.hook_text,
             "cliffhanger_event_id": self.cliffhanger_event_id,
+            "cliffhanger_text": self.cliffhanger_text,
             "reason": self.reason,
             "repairs_applied": self.repairs_applied,
             "segments": [seg.to_dict() for seg in self.segments],
@@ -257,19 +261,19 @@ class RuleValidator:
         # 6. Duration bounds check & whole-event repair (20.0s - 60.0s)
         total_duration = sum(s.duration for s in assembled_segments)
 
-        # Attempt extension if slightly short (15s to <20s)
+        # Attempt extension if short: append adjacent same-scene events, but never let the cut
+        # drift more than 4s past the cliffhanger (same tolerance as rule 5), or it stops being a cliffhanger.
         if total_duration < 20.0:
-            # Try appending adjacent events to last segment within same scene if available
             ep = self.episodes_by_num[last_seg.episode]
             cur_end_order = self.event_order[last_seg.end_event_id]
             extended = False
             while total_duration < 20.0 and cur_end_order + 1 < len(ep.events):
                 next_ev = ep.events[cur_end_order + 1]
-                # Keep within reasonable proximity and scene
-                if next_ev.scene == ep.events[cur_end_order].scene:
+                new_end = max(last_seg.end, next_ev.end)
+                if next_ev.scene == ep.events[cur_end_order].scene and new_end - cliff_ev.end <= 4.0:
                     cur_end_order += 1
                     last_seg.end_event_id = next_ev.id
-                    last_seg.end = next_ev.end
+                    last_seg.end = new_end
                     last_seg.end_ts = format_timestamp(next_ev.end)
                     last_seg.events = ep.events[self.event_order[last_seg.start_event_id] : cur_end_order + 1]
                     total_duration = sum(s.duration for s in assembled_segments)
@@ -298,6 +302,24 @@ class RuleValidator:
             if trimmed and total_duration <= 60.0:
                 repairs.append(f"Trimmed trailing events to {total_duration:.1f}s")
 
+        # 7. Snap every cut to whole lines on the real timeline. Camera and dialogue events overlap
+        # in time, so an ID range can end while a line is still being spoken (or start mid-line).
+        for seg in assembled_segments:
+            if self._snap_to_whole_lines(seg):
+                repairs.append(f"Widened Ep {seg.episode} segment to {seg.start_ts}-{seg.end_ts} to avoid a mid-line cut")
+        for i in range(len(assembled_segments) - 1):
+            cur, nxt = assembled_segments[i], assembled_segments[i + 1]
+            if cur.episode == nxt.episode and cur.end > nxt.start:
+                return self._record_rejection(
+                    "segment_overlap", f"Segments {i} and {i+1} overlap after snapping to whole lines"
+                )
+        total_duration = sum(s.duration for s in assembled_segments)
+        hook_offset = hook_ev.start - first_seg.start
+        if hook_offset > 3.0:
+            return self._record_rejection(
+                "hook_after_3s", f"Hook event {hook_id} at +{hook_offset:.1f}s after snapping to whole lines"
+            )
+
         if total_duration < 20.0 or total_duration > 60.0:
             return self._record_rejection(
                 "duration_out_of_bounds",
@@ -316,5 +338,32 @@ class RuleValidator:
             hook_offset=round(hook_offset, 2),
             is_cross_episode=is_cross,
             repairs_applied=repairs,
+            hook_text=hook_ev.line(),
+            cliffhanger_text=cliff_ev.line(),
         )
         return ValidationResult(promo=validated_promo, is_valid=True)
+
+    def _snap_to_whole_lines(self, seg: PromoSegment) -> bool:
+        """Widen seg so no dialogue line straddles its start or end; rebuild its events from the time window.
+
+        Returns True if the window moved.
+        """
+        ep = self.episodes_by_num[seg.episode]
+        start, end = seg.start, seg.end
+        # ponytail: fixed-point loop over the episode's events, O(n) per pass; the window only grows, so it ends.
+        while True:
+            straddling = [
+                e for e in ep.events
+                if e.kind == "dialogue" and e.start < end - 0.05 and e.end > start + 0.05
+            ]
+            new_start = min([start] + [e.start for e in straddling])
+            new_end = max([end] + [e.end for e in straddling])
+            if (new_start, new_end) == (start, end):
+                break
+            start, end = new_start, new_end
+        moved = (start, end) != (seg.start, seg.end)
+        seg.events = [e for e in ep.events if start - 0.01 <= e.start < end]
+        seg.start, seg.end = start, end
+        seg.start_ts, seg.end_ts = format_timestamp(start), format_timestamp(end)
+        seg.start_event_id, seg.end_event_id = seg.events[0].id, seg.events[-1].id
+        return moved

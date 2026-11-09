@@ -49,15 +49,24 @@
 
 - **Composite Scoring Formula**:
   - *Formula*: `score = 0.40 * clarity + 0.35 * hook + 0.25 * cliffhanger + 0.25 * cross_bonus`
-  - *Why*: In performance marketing for microdramas, clarity is paramount (0.40). If a viewer cannot understand who is who in the first 5 seconds, they swipe away immediately regardless of the cliffhanger. Hook is weighted 0.35 to guarantee top-of-funnel scroll stopping, and cliffhanger is 0.25 to drive the install. A small bonus (+0.25) is awarded to cross-episode arcs for their higher editorial complexity.
+  - *Why*: In performance marketing for microdramas, clarity is paramount (0.40). If a viewer cannot understand who is who in the first 5 seconds, they swipe away immediately regardless of the cliffhanger. Hook is weighted 0.35 to guarantee top-of-funnel scroll stopping, and cliffhanger is 0.25 to drive the install. A small bonus (+0.25) is awarded to cross-episode arcs (only when clarity >= 4) for their higher editorial complexity.
+  - *Ties*: 1-5 scores tie often, so ties break on the judge's 0-100 tap-through estimate, then closeness to 35s. Judge failures score 0 instead of a silent "average" 3.
 
 - **Temporal Deduplication & Diversity Constraint**:
   - *Decision*: Promos sharing >50% temporal overlap (Intersection-over-Union of active timestamps) are deduplicated, keeping only the highest-scoring cut. Furthermore, a maximum of 2 promos per scene are permitted in the top 10.
   - *Why*: Prevents ranking tables from filling up with 5 slight variations of the same viral scene.
 
-- **Adversarial Quality Benchmark**:
-  - *Decision*: Five synthetic probe clips (passive camera pans, premature cuts, mid-sentence dialogue cuts, low-stakes monologues, out-of-order stitching) are passed to the judge to verify calibration.
-  - *Why*: Protects against LLM judge "grade inflation" and verifies the model detects weak dramatic structure.
+- **Judge Sanity Check**:
+  - *Decision*: Judge 10 seed-fixed random 35s windows and 3 incoherent splices (three unrelated 10s moments from different episodes). Report the gap between our top-10 mean score and the random mean, and whether splices get clarity <= 3.
+  - *Why*: Hand-picked "bad" probes by event index turned out to be strong scenes. A random baseline answers the real question: does the ranking beat chance on this show?
+
+- **Cross-Episode Pass Runs After Judging**:
+  - *Decision*: Pass B sees the best judged single-episode clip from up to 15 episodes (IDs + timestamps) and must join segments from at least 2 episodes. Single-episode Pass B output is rejected.
+  - *Why*: The first version only fed Pass B lines from Episode 1, so it never produced a cross-episode promo.
+
+- **Whole-Line Cuts on the Real Timeline**:
+  - *Decision*: After repairs, each segment is widened until no dialogue line straddles its start or end; its events are rebuilt from the time window.
+  - *Why*: Camera and dialogue events overlap in time, so cutting at "the last event by ID" could cut a line that is still playing.
 
 - **Thread-Safe Rate Limiting**:
   - *Decision*: Implemented `_rate_limit_lock` and a minimum 3.6s call interval across threads in `promo_finder/llm.py`.

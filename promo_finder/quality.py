@@ -1,11 +1,11 @@
-"""Quality validation, stability benchmarking, judge sanity tests, and review sheet generation.
+"""Quality checks, stability benchmark, human review sheet, run summary and cost.
 
-Performs:
-1. Judge sanity check on 5 deliberately flawed promo cuts (measuring failure detection).
-2. Stability benchmarking (cache-bypassed re-run measuring candidate overlap).
-3. Human review sheet generation (outputs/full_run/human_review.csv).
-4. Run summary and cost modeling citing official Vertex AI pricing.
-5. Comprehensive quality report markdown generation.
+1. Judge sanity: does the judge score our picks above random 35s windows, and does it give
+   incoherent 3-episode splices low clarity? If not, the ranking is not telling us much.
+2. Stability: re-run Pass A on a few episodes with the cache bypassed and measure overlap.
+3. Human review sheet with empty verdict columns for an editor to fill in.
+4. Run summary with token usage and cost at configurable per-token prices.
+5. Quality report built from this run's numbers.
 """
 
 from __future__ import annotations
@@ -13,223 +13,169 @@ from __future__ import annotations
 import csv
 import json
 import logging
-import shutil
-import time
+import os
+import random
+import statistics
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
 from promo_finder.finder import generate_single_episode_candidates, judge_cold_viewer
-from promo_finder.parse import Episode, format_timestamp
-from promo_finder.rank import calculate_overlap_ratio, compute_promo_score, rank_and_deduplicate_promos
-from promo_finder.validate import PromoSegment, RuleValidator, ValidatedPromo
+from promo_finder.parse import Episode
+from promo_finder.rank import calculate_overlap_ratio, compute_promo_score
+from promo_finder.validate import RuleValidator
 
 logger = logging.getLogger("promo_finder.quality")
 
+# Vertex AI standard price for gemini-2.5-flash (USD per 1M tokens; output includes thinking tokens).
+# Source: https://cloud.google.com/vertex-ai/generative-ai/pricing (checked 2026-11-09).
+# Override with env vars when swapping models.
+PRICE_INPUT_PER_M = float(os.getenv("LLM_PRICE_INPUT_PER_M", "0.30"))
+PRICE_OUTPUT_PER_M = float(os.getenv("LLM_PRICE_OUTPUT_PER_M", "2.50"))
 
-def run_judge_sanity_tests(episodes: list[Episode], use_cache: bool = True) -> list[dict[str, Any]]:
-    """Run cold-viewer judge against 5 deliberately flawed promos to verify it detects bad picks."""
-    ep1 = episodes[0]
+
+def _window(ep: Episode, start_idx: int, target_sec: float) -> dict[str, str]:
+    """Whole-event segment starting at start_idx and running about target_sec."""
+    evs = ep.events
+    j = start_idx
+    while j + 1 < len(evs) and evs[j].end - evs[start_idx].start < target_sec:
+        j += 1
+    return {"start_event_id": evs[start_idx].id, "end_event_id": evs[j].id}
+
+
+def _judge_candidate(validator: RuleValidator, cand: dict[str, Any], use_cache: bool) -> dict[str, Any] | None:
+    res = validator.validate_candidate(cand)
+    if not res.promo:
+        return None
+    try:
+        j = judge_cold_viewer(res.promo, use_cache=use_cache)
+    except Exception as err:
+        logger.warning("Sanity judge failed for %s: %s", cand["promo_id"], err)
+        return None
+    segs = "; ".join(f"Ep {s.episode} {s.start_ts}-{s.end_ts}" for s in res.promo.segments)
+    return {"promo_id": cand["promo_id"], "segments": segs, "judge": j, "score": compute_promo_score({"judge": j})}
+
+
+def run_judge_sanity_tests(
+    episodes: list[Episode],
+    ranked_promos: list[dict[str, Any]],
+    n_random: int = 10,
+    n_splices: int = 3,
+    seed: int = 7,
+    use_cache: bool = True,
+) -> dict[str, Any]:
+    """Compare judge scores on our top picks vs. random windows and incoherent splices."""
+    rng = random.Random(seed)
     validator = RuleValidator(episodes)
-    results = []
+    usable = [ep for ep in episodes if len(ep.events) > 20]
 
-    # Test Case 1: Mid-conversation start without hook, flat resolution cut
-    cand1 = {
-        "promo_id": "SANITY-BAD-1-NO-HOOK",
-        "segments": [{"start_event_id": ep1.events[10].id, "end_event_id": ep1.events[18].id}],
-        "hook_event_id": ep1.events[10].id,
-        "cliffhanger_event_id": ep1.events[18].id,
-        "reason": "Deliberately boring start and mundane cut",
-    }
-    val1 = validator.validate_candidate(cand1)
-    if val1.promo:
-        j1 = judge_cold_viewer(val1.promo, use_cache=use_cache)
-        results.append({
-            "test_case": "No hook / Mundane conversation start",
-            "promo_id": cand1["promo_id"],
-            "expected_flaw": "Low hook score (<=3)",
-            "hook": j1.get("hook_strength"),
-            "cliff": j1.get("cliffhanger_strength"),
-            "clarity": j1.get("standalone_clarity"),
-            "summary": j1.get("summary"),
-            "passed_sanity": j1.get("hook_strength", 5) <= 3 or j1.get("cliffhanger_strength", 5) <= 3,
-        })
-
-    # Test Case 2: Pure camera shots (no dialogue / no stakes)
-    cam_events = [e for e in ep1.events if e.kind == "camera"]
-    if len(cam_events) >= 6:
-        cand2 = {
-            "promo_id": "SANITY-BAD-2-NO-ACTION",
-            "segments": [{"start_event_id": cam_events[0].id, "end_event_id": cam_events[5].id}],
-            "hook_event_id": cam_events[0].id,
-            "cliffhanger_event_id": cam_events[5].id,
-            "reason": "Pure camera pans with zero plot stakes",
+    baseline: list[dict[str, Any]] = []
+    attempts = 0
+    while usable and len(baseline) < n_random and attempts < n_random * 4:
+        attempts += 1
+        ep = rng.choice(usable)
+        seg = _window(ep, rng.randrange(len(ep.events) - 1), 35.0)
+        cand = {
+            "promo_id": f"RANDOM-{len(baseline) + 1:02d}",
+            "segments": [seg],
+            "hook_event_id": seg["start_event_id"],
+            "cliffhanger_event_id": seg["end_event_id"],
+            "reason": "Random 35s window (baseline)",
         }
-        val2 = validator.validate_candidate(cand2)
-        if val2.promo:
-            j2 = judge_cold_viewer(val2.promo, use_cache=use_cache)
-            results.append({
-                "test_case": "Passive camera shots without dialogue",
-                "promo_id": cand2["promo_id"],
-                "expected_flaw": "Low clarity or low cliffhanger (<=3)",
-                "hook": j2.get("hook_strength"),
-                "cliff": j2.get("cliffhanger_strength"),
-                "clarity": j2.get("standalone_clarity"),
-                "summary": j2.get("summary"),
-                "passed_sanity": j2.get("standalone_clarity", 5) <= 3 or j2.get("cliffhanger_strength", 5) <= 3,
-            })
+        r = _judge_candidate(validator, cand, use_cache)
+        if r:
+            baseline.append(r)
 
-    # Test Case 3: Incoherent cross-episode clip (Ep 1 random line + Ep 3 random line)
-    if len(episodes) >= 3:
-        ep3 = episodes[2]
-        cand3 = {
-            "promo_id": "SANITY-BAD-3-INCOHERENT",
-            "segments": [
-                {"start_event_id": ep1.events[15].id, "end_event_id": ep1.events[19].id},
-                {"start_event_id": ep3.events[10].id, "end_event_id": ep3.events[14].id},
-            ],
-            "hook_event_id": ep1.events[15].id,
-            "cliffhanger_event_id": ep3.events[14].id,
-            "reason": "Unrelated joined scenes from different episodes",
+    splices: list[dict[str, Any]] = []
+    attempts = 0
+    while len(usable) >= 3 and len(splices) < n_splices and attempts < n_splices * 4:
+        attempts += 1
+        picked = sorted(rng.sample(usable, 3), key=lambda e: e.number)
+        segs = [_window(ep, rng.randrange(len(ep.events) - 1), 10.0) for ep in picked]
+        cand = {
+            "promo_id": f"SPLICE-{len(splices) + 1:02d}",
+            "segments": segs,
+            "hook_event_id": segs[0]["start_event_id"],
+            "cliffhanger_event_id": segs[-1]["end_event_id"],
+            "reason": "Three unrelated 10s moments from different episodes",
         }
-        val3 = validator.validate_candidate(cand3)
-        if val3.promo:
-            j3 = judge_cold_viewer(val3.promo, use_cache=use_cache)
-            results.append({
-                "test_case": "Incoherent cross-episode jump",
-                "promo_id": cand3["promo_id"],
-                "expected_flaw": "Low standalone clarity score (<=3)",
-                "hook": j3.get("hook_strength"),
-                "cliff": j3.get("cliffhanger_strength"),
-                "clarity": j3.get("standalone_clarity"),
-                "summary": j3.get("summary"),
-                "passed_sanity": j3.get("standalone_clarity", 5) <= 3,
-            })
+        r = _judge_candidate(validator, cand, use_cache)
+        if r:
+            r["passed"] = r["judge"].get("standalone_clarity", 5) <= 3
+            splices.append(r)
 
-    # Test Case 4: Premature cut before conflict begins
-    cand4 = {
-        "promo_id": "SANITY-BAD-4-RESOLVED",
-        "segments": [{"start_event_id": ep1.events[2].id, "end_event_id": ep1.events[7].id}],
-        "hook_event_id": ep1.events[2].id,
-        "cliffhanger_event_id": ep1.events[7].id,
-        "reason": "Pre-conflict calm entrance",
+    top = [p for p in ranked_promos[:10] if "error" not in p.get("judge", {})]
+    top_mean = statistics.mean(p["score"] for p in top) if top else 0.0
+    base_mean = statistics.mean(r["score"] for r in baseline) if baseline else 0.0
+    return {
+        "baseline": baseline,
+        "splices": splices,
+        "top10_mean_score": round(top_mean, 3),
+        "random_mean_score": round(base_mean, 3),
+        "random_beaten_by_top10": sum(1 for r in baseline if r["score"] < top_mean),
+        # ponytail: 0.5-point margin on a ~1-5 scale is a judgment call, not a calibrated threshold.
+        "discriminates": bool(baseline) and top_mean - base_mean >= 0.5,
     }
-    val4 = validator.validate_candidate(cand4)
-    if val4.promo:
-        j4 = judge_cold_viewer(val4.promo, use_cache=use_cache)
-        results.append({
-            "test_case": "Premature cut before conflict begins",
-            "promo_id": cand4["promo_id"],
-            "expected_flaw": "Low cliffhanger tension (<=3)",
-            "hook": j4.get("hook_strength"),
-            "cliff": j4.get("cliffhanger_strength"),
-            "clarity": j4.get("standalone_clarity"),
-            "summary": j4.get("summary"),
-            "passed_sanity": j4.get("cliffhanger_strength", 5) <= 3 or j4.get("hook_strength", 5) <= 3,
-        })
-
-    # Test Case 5: Isolated ambiguous dialogue snippet
-    cand5 = {
-        "promo_id": "SANITY-BAD-5-VAGUE-SNIPPET",
-        "segments": [{"start_event_id": ep1.events[30].id, "end_event_id": ep1.events[36].id}],
-        "hook_event_id": ep1.events[30].id,
-        "cliffhanger_event_id": ep1.events[36].id,
-        "reason": "Isolated background crowd dialogue",
-    }
-    val5 = validator.validate_candidate(cand5)
-    if val5.promo:
-        j5 = judge_cold_viewer(val5.promo, use_cache=use_cache)
-        results.append({
-            "test_case": "Isolated ambiguous dialogue snippet",
-            "promo_id": cand5["promo_id"],
-            "expected_flaw": "Lower standalone clarity or cliffhanger",
-            "hook": j5.get("hook_strength"),
-            "cliff": j5.get("cliffhanger_strength"),
-            "clarity": j5.get("standalone_clarity"),
-            "summary": j5.get("summary"),
-            "passed_sanity": j5.get("standalone_clarity", 5) <= 3 or j5.get("cliffhanger_strength", 5) <= 3,
-        })
-
-    return results
 
 
 def run_stability_check(
     episodes: list[Episode], base_validated_promos: list[dict[str, Any]], sample_episodes: int = 3
 ) -> dict[str, Any]:
-    """Re-run candidate generation on a sample of episodes bypassing cache to measure top candidate overlap."""
-    validator = RuleValidator(episodes[:sample_episodes])
+    """Re-run Pass A on the first few episodes with the cache bypassed; measure overlap with the main run."""
     sample_eps = episodes[:sample_episodes]
+    sample_nums = {ep.number for ep in sample_eps}
+    validator = RuleValidator(sample_eps)
 
-    # Run fresh candidates with higher temperature / cache bypassed
     fresh_promos: list[dict[str, Any]] = []
     for ep in sample_eps:
         try:
-            # We call candidate generator with use_cache=False
             cands = generate_single_episode_candidates(ep, max_candidates=4, use_cache=False)
-            for c_idx, c in enumerate(cands, 1):
-                if not c.get("promo_id"):
-                    c["promo_id"] = f"FRESH-E{ep.number:02d}-P{c_idx}"
-                val_res = validator.validate_candidate(c)
-                if val_res.is_valid and val_res.promo:
-                    p_dict = val_res.promo.to_dict()
-                    # Synthetic neutral score for comparison
-                    p_dict["judge"] = {"hook_strength": 4, "cliffhanger_strength": 4, "standalone_clarity": 4}
-                    p_dict["score"] = compute_promo_score(p_dict)
-                    fresh_promos.append(p_dict)
         except Exception as err:
             logger.warning("Stability check fresh run failed for ep %d: %s", ep.number, err)
+            continue
+        for c_idx, c in enumerate(cands, 1):
+            c["promo_id"] = f"FRESH-E{ep.number:02d}-P{c_idx}"
+            val_res = validator.validate_candidate(c)
+            if val_res.promo:
+                fresh_promos.append(val_res.promo.to_dict())
 
-    # Filter base promos to the same sample episodes
-    base_sample_promos = [
+    base_sample = [
         p for p in base_validated_promos
-        if any(s["episode"] <= sample_episodes for s in p["segments"])
-    ][:10]
-
-    # Calculate overlap between base promos and fresh promos
-    overlap_matches = 0
-    total_compared = min(len(base_sample_promos), len(fresh_promos))
-
-    for b_p in base_sample_promos[:total_compared]:
-        has_overlap = any(calculate_overlap_ratio(b_p, f_p) >= 0.40 for f_p in fresh_promos)
-        if has_overlap:
-            overlap_matches += 1
-
-    overlap_pct = (overlap_matches / total_compared * 100.0) if total_compared > 0 else 0.0
-
+        if not p["is_cross_episode"] and p["segments"][0]["episode"] in sample_nums
+    ]
+    matches = sum(
+        1 for b in base_sample if any(calculate_overlap_ratio(b, f) >= 0.40 for f in fresh_promos)
+    )
+    pct = matches / len(base_sample) * 100.0 if base_sample else 0.0
     return {
-        "sample_episodes": sample_episodes,
-        "base_candidate_count": len(base_sample_promos),
+        "sample_episodes": len(sample_eps),
+        "base_candidate_count": len(base_sample),
         "fresh_candidate_count": len(fresh_promos),
-        "overlap_matches": overlap_matches,
-        "overlap_percentage": round(overlap_pct, 1),
+        "overlap_matches": matches,
+        "overlap_percentage": round(pct, 1),
     }
 
 
-def generate_human_review_csv(
-    top_promos: list[dict[str, Any]], out_path: Path, events_by_id: dict[str, Any]
-) -> None:
-    """Generate review sheet for human editor spot-check."""
+def generate_human_review_csv(top_promos: list[dict[str, Any]], out_path: Path) -> None:
+    """Review sheet for an editor. Verdict columns are left empty on purpose."""
+    if not top_promos:
+        return
     out_path.parent.mkdir(parents=True, exist_ok=True)
     rows = []
     for p in top_promos[:10]:
-        h_ev = events_by_id.get(p["hook_event_id"])
-        c_ev = events_by_id.get(p["cliffhanger_event_id"])
-        h_txt = f"{h_ev.speaker or 'Action'}: {h_ev.text}" if h_ev else ""
-        c_txt = f"{c_ev.speaker or 'Action'}: {c_ev.text}" if c_ev else ""
-        seg_str = "; ".join([f"Ep {s['episode']} ({s['start_ts']}-{s['end_ts']})" for s in p["segments"]])
-
         rows.append({
             "rank": p["rank"],
             "promo_id": p["promo_id"],
             "duration": f"{p['total_duration']}s",
-            "segments": seg_str,
-            "hook_text": h_txt,
-            "cliffhanger_text": c_txt,
-            "hook_ok": "Y",  # Pre-populated based on validation checks
-            "cliff_ok": "Y",
-            "standalone_ok": "Y",
-            "editor_notes": "Meets 3s hook and cliffhanger criteria.",
+            "segments": "; ".join(f"Ep {s['episode']} ({s['start_ts']}-{s['end_ts']})" for s in p["segments"]),
+            "hook_text": p.get("hook_text", ""),
+            "cliffhanger_text": p.get("cliffhanger_text", ""),
+            "hook_ok (Y/N)": "",
+            "cliff_ok (Y/N)": "",
+            "standalone_ok (Y/N)": "",
+            "would_post (Y/N)": "",
+            "editor_notes": "",
         })
-
     with open(out_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
@@ -237,118 +183,142 @@ def generate_human_review_csv(
 
 
 def parse_usage_summary(usage_path: Path) -> dict[str, Any]:
-    """Parse usage.jsonl and calculate token totals and cost estimates."""
-    if not usage_path.exists():
-        return {
-            "total_calls": 0,
-            "cached_calls": 0,
-            "live_calls": 0,
-            "prompt_tokens": 0,
-            "candidates_tokens": 0,
-            "total_tokens": 0,
-            "cost_usd": 0.0,
-        }
+    """Sum token usage for one run and price it."""
+    totals = {"total_calls": 0, "cached_calls": 0, "live_calls": 0, "prompt_tokens": 0, "candidates_tokens": 0}
+    if usage_path.exists():
+        with open(usage_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                entry = json.loads(line)
+                totals["total_calls"] += 1
+                if entry.get("cached"):
+                    totals["cached_calls"] += 1
+                else:
+                    totals["live_calls"] += 1
+                    totals["prompt_tokens"] += entry.get("prompt_tokens", 0)
+                    totals["candidates_tokens"] += entry.get("candidates_tokens", 0)
+    totals["total_tokens"] = totals["prompt_tokens"] + totals["candidates_tokens"]
+    cost = totals["prompt_tokens"] / 1e6 * PRICE_INPUT_PER_M + totals["candidates_tokens"] / 1e6 * PRICE_OUTPUT_PER_M
+    totals["cost_usd"] = round(cost, 4)
+    return totals
 
-    total_calls = 0
-    cached_calls = 0
-    live_calls = 0
-    prompt_tokens = 0
-    candidates_tokens = 0
 
-    with open(usage_path, "r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            entry = json.loads(line)
-            total_calls += 1
-            if entry.get("cached"):
-                cached_calls += 1
-            else:
-                live_calls += 1
-                prompt_tokens += entry.get("prompt_tokens", 0)
-                candidates_tokens += entry.get("candidates_tokens", 0)
-
-    # Official Vertex AI pricing for Gemini 2.5 Flash:
-    # Text input: $0.15 per 1,000,000 tokens
-    # Text output: $0.60 per 1,000,000 tokens
-    # Citation: https://cloud.google.com/vertex-ai/generative-ai/pricing
-    cost = (prompt_tokens / 1_000_000 * 0.15) + (candidates_tokens / 1_000_000 * 0.60)
-
-    return {
-        "total_calls": total_calls,
-        "cached_calls": cached_calls,
-        "live_calls": live_calls,
-        "prompt_tokens": prompt_tokens,
-        "candidates_tokens": candidates_tokens,
-        "total_tokens": prompt_tokens + candidates_tokens,
-        "cost_usd": round(cost, 4),
-    }
+def _dist(values: list[Any]) -> str:
+    c = Counter(values)
+    return ", ".join(f"{k}: {c.get(k, 0)}" for k in (1, 2, 3, 4, 5))
 
 
 def write_quality_report(
     out_dir: Path,
     validator_tally: dict[str, int],
     total_candidates: int,
-    sanity_results: list[dict[str, Any]],
-    stability_results: dict[str, Any],
+    evaluated: list[dict[str, Any]],
+    ranked: list[dict[str, Any]],
+    sanity: dict[str, Any],
+    stability: dict[str, Any],
 ) -> None:
-    """Write comprehensive quality and adversarial robustness report."""
+    """Quality report built from this run's numbers."""
+    judged = [p for p in evaluated if "error" not in p.get("judge", {})]
+    n = max(1, len(judged))
+    rejected = sum(validator_tally.values())
     md = [
-        "# Quality & Robustness Report",
+        "# Quality Report",
         "",
-        "## 1. Rule Validator Rejection Tally",
-        f"Out of **{total_candidates}** total candidate proposals generated by Gemini:",
+        "## 1. Rule validator",
+        f"{total_candidates} candidates proposed, {rejected} rejected, {len(evaluated)} passed.",
         "",
-        "| Rule Violated | Rejections | Impact / Safeguard |",
-        "|---|---|---|",
+        "| Rule | Rejections |",
+        "|---|---|",
     ]
-    for rule, count in validator_tally.items():
-        if count > 0:
-            md.append(f"| `{rule}` | **{count}** | Caught by pure-code validator before publishing |")
-    md.extend([
+    md += [f"| `{rule}` | {count} |" for rule, count in validator_tally.items() if count > 0] or ["| (none) | 0 |"]
+    repairs = Counter(r.split(" ")[0] for p in evaluated for r in p.get("repairs_applied", []))
+    md += [
         "",
-        "> [!IMPORTANT]",
-        "> These rejections demonstrate why LLMs must never be permitted to generate timestamps directly: "
-        "the deterministic rule validator acts as an inviolable gatekeeper.",
+        f"Repairs applied to passing promos: {dict(repairs) or 'none'} "
+        "(Widened = cut moved so no line is cut mid-sentence; Trimmed/Snapped/Extended = whole-event boundary fixes).",
         "",
-        "## 2. Cold-Viewer Judge Sanity Check (Adversarial Probing)",
-        "To verify that the cold-viewer judge discriminates against low-quality cuts rather than blindly awarding high scores, "
-        "5 deliberately flawed promo clips were constructed from real screenplay events and submitted to the judge:",
+        "## 2. Judge score distribution (all passing promos)",
+        f"- Judge failures: {len(evaluated) - len(judged)}",
+    ]
+    for key, label in [("hook_strength", "Hook"), ("cliffhanger_strength", "Cliffhanger"), ("standalone_clarity", "Clarity")]:
+        vals = [p["judge"].get(key) for p in judged]
+        fives = sum(1 for v in vals if v == 5) / n * 100
+        md.append(f"- {label}: {_dist(vals)} ({fives:.0f}% are 5/5)")
+    ceiling = [
+        label for key, label in [("hook_strength", "hook"), ("cliffhanger_strength", "cliffhanger"), ("standalone_clarity", "clarity")]
+        if sum(1 for p in judged if p["judge"].get(key) == 5) / n > 0.5
+    ]
+    if ceiling:
+        md.append(f"- Warning: over half of promos get 5/5 on {', '.join(ceiling)}, so that score barely separates them.")
+    cross_all = sum(1 for p in evaluated if p["is_cross_episode"])
+    cross_top = sum(1 for p in ranked if p["is_cross_episode"])
+    top_eps = sorted({s["episode"] for p in ranked for s in p["segments"]})
+    md += [
+        f"- Cross-episode promos: {cross_all} passed validation, {cross_top} in the final top {len(ranked)}.",
+        f"- Episodes used by the top {len(ranked)}: {top_eps}",
         "",
-        "| Test Case | Expected Defect | Judge Scores (Hook / Cliff / Clarity) | Sanity Result |",
+        "## 3. Does the judge tell good picks from bad ones?",
+        f"Random 35-second windows (seed-fixed) vs. our top 10: mean score **{sanity['random_mean_score']}** "
+        f"vs. **{sanity['top10_mean_score']}**. Our top-10 mean beats {sanity['random_beaten_by_top10']} of "
+        f"{len(sanity['baseline'])} random windows.",
+        "",
+        "**Result: the judge separates picks from random windows.**" if sanity["discriminates"] else
+        "**Result: the judge does NOT clearly separate our picks from random windows (gap < 0.5).** "
+        "This show is dense with conflict, so random cuts also look dramatic on paper; treat scores as a coarse filter "
+        "and keep an editor on the final pick.",
+        "",
+        "| Probe | Segments | Hook / Cliff / Clarity | Score |",
         "|---|---|---|---|",
-    ])
-    for s in sanity_results:
-        status = "PASSED (Flaw Detected)" if s["passed_sanity"] else "FAILED (Over-scored)"
-        md.append(f"| {s['test_case']} | {s['expected_flaw']} | {s['hook']}/5, {s['cliff']}/5, {s['clarity']}/5 | **{status}** |")
+    ]
+    for r in sanity["baseline"]:
+        j = r["judge"]
+        md.append(f"| {r['promo_id']} | {r['segments']} | {j.get('hook_strength')}/{j.get('cliffhanger_strength')}/{j.get('standalone_clarity')} | {r['score']} |")
+    md += ["", "Incoherent splices (3 unrelated 10s moments from different episodes; expect clarity <= 3):", "",
+           "| Probe | Segments | Hook / Cliff / Clarity | Flagged? |", "|---|---|---|---|"]
+    for r in sanity["splices"]:
+        j = r["judge"]
+        md.append(f"| {r['promo_id']} | {r['segments']} | {j.get('hook_strength')}/{j.get('cliffhanger_strength')}/{j.get('standalone_clarity')} | {'yes' if r['passed'] else '**no, over-scored**'} |")
 
-    md.extend([
+    weakest = sorted(judged, key=lambda p: (p["judge"].get("standalone_clarity", 5), compute_promo_score(p)))[:5]
+    md += [
         "",
-        "## 3. Candidate Generation Stability Benchmark",
-        f"- Tested on **{stability_results['sample_episodes']} episodes** with cache bypassed.",
-        f"- Top-10 Candidate Temporal Overlap: **{stability_results['overlap_percentage']}%**",
-        "- The high overlap confirms that key dramatic beats (betrayal at altar, accusations) are consistently identified "
-        "despite LLM sampling variance.",
+        "## 4. Where the tool picks badly (lowest-clarity promos it proposed)",
         "",
-        "## 4. Known Failure Modes & Honest Limitations",
-        "1. **Script vs. Final Cut Drift**: Script timestamps represent initial pacing. Edited footage may cut pauses, "
-        "requiring human alignment or automated video ASR sync.",
-        "2. **Visual-Only Action Hooks**: High-impact visual moments (e.g. a sudden slap or vase smash) described solely in "
-        "ACTION lines may be slightly underscored compared to explosive dialogue lines.",
-        "3. **Self-Agreement Bias**: The cold-viewer judge shares the Gemini model family with candidate generation, "
-        "which can introduce subtle preference alignment.",
-        "4. **Cross-Episode Context Gaps**: Cross-episode joins can disorient first-time viewers if visual character changes "
-        "occur between episodes without clear establishing context.",
-        "5. **Major Plot Spoilers**: A late-episode twist (e.g. Episode 33 revelation) may make an irresistible promo "
-        "but spoil the narrative progression for viewers starting at Episode 1.",
-    ])
+        "| Promo | Segments | Hook / Cliff / Clarity | What confused the judge |",
+        "|---|---|---|---|",
+    ]
+    for p in weakest:
+        j = p["judge"]
+        segs = "; ".join(f"Ep {s['episode']} {s['start_ts']}-{s['end_ts']}" for s in p["segments"])
+        confusion = str(j.get("confusion", "")).replace("|", "/").replace("\n", " ")
+        md.append(f"| {p['promo_id']} | {segs} | {j.get('hook_strength')}/{j.get('cliffhanger_strength')}/{j.get('standalone_clarity')} | {confusion} |")
 
+    stable_txt = (
+        "Most picks reappear on a fresh run." if stability["overlap_percentage"] >= 70 else
+        "Many picks change between runs, so a single run should not be treated as the definitive list."
+    )
+    md += [
+        "",
+        "## 5. Stability (Pass A re-run with cache bypassed)",
+        f"- {stability['sample_episodes']} episodes: {stability['overlap_matches']} of {stability['base_candidate_count']} "
+        f"original promos have a fresh-run match with >= 40% overlap ({stability['overlap_percentage']}%). {stable_txt}",
+        "",
+        "## 6. Known limits",
+        "1. Script timestamps, not footage: the final edit may drift from the screenplay timing, so an editor should check cuts against video.",
+        "2. Text-only judge: it reads camera/action descriptions but never sees the actual performance, music or faces.",
+        "3. Same model family generates and judges, which can bias the judge toward its own picks.",
+        "4. Spoilers: late-episode twists can make strong ads but give away the plot; the post-first note flags them, it does not block them.",
+        "5. The 1-5 scores are coarse; ties are broken by the judge's 0-100 tap-through guess, which is not calibrated against real click data.",
+    ]
     with open(out_dir / "quality_report.md", "w", encoding="utf-8") as f:
         f.write("\n".join(md) + "\n")
 
 
 def write_run_summary(
     out_dir: Path,
+    show_name: str,
+    model: str,
     total_episodes: int,
     total_events: int,
     total_candidates: int,
@@ -356,31 +326,31 @@ def write_run_summary(
     wall_time: float,
     usage: dict[str, Any],
 ) -> None:
-    """Write run summary and unit economics documentation."""
-    summary_md = f"""# Run Summary & Unit Economics
+    """Run summary and unit economics for this run only."""
+    per_ep = usage["cost_usd"] / max(1, total_episodes)
+    cache_note = (
+        f"\n> {usage['cached_calls']} calls came from the local cache and cost nothing here, "
+        "so this undercounts a fresh run. Use `--no-cache` for a true cost figure.\n"
+        if usage["cached_calls"] else ""
+    )
+    summary_md = f"""# Run Summary
 
-## Execution Metrics
-- **Dataset**: First {total_episodes} episodes of *I Married a Broken Soldier. He was a Duke*
-- **Total Screenplay Events Analyzed**: {total_events:,}
-- **Total Candidate Promos Proposed**: {total_candidates}
-- **Promos Passing Hard Editorial Rules**: {total_valid}
-- **Wall Clock Time**: {wall_time:.2f}s
-- **Primary LLM Model**: `gemini-2.5-flash` on Google Cloud Vertex AI
+## Execution
+- **Show**: {show_name} ({total_episodes} episodes)
+- **Screenplay events parsed**: {total_events:,}
+- **Candidates proposed**: {total_candidates}
+- **Passed hard rules**: {total_valid}
+- **Wall-clock time**: {wall_time:.0f}s
+- **Model**: `{model}`
 
-## Token Usage & Cost Breakdown
-- **Total API Calls**: {usage['total_calls']}
-- **Live Calls Executed**: {usage['live_calls']} (Cached calls: {usage['cached_calls']})
-- **Total Input Tokens (Prompt)**: {usage['prompt_tokens']:,}
-- **Total Output Tokens (Candidates)**: {usage['candidates_tokens']:,}
-- **Total Tokens**: {usage['total_tokens']:,}
-
-### Unit Economics (Vertex AI Official Pricing)
-- Input Pricing: **$0.15** per 1,000,000 tokens
-- Output Pricing: **$0.60** per 1,000,000 tokens
-- Citation: [Google Cloud Vertex AI Pricing](https://cloud.google.com/vertex-ai/generative-ai/pricing)
-- **Total Run Cost**: **${usage['cost_usd']:.4f} USD** (~${usage['cost_usd']:.2f})
-- **Cost Per 50-Episode Show**: **${usage['cost_usd']:.4f} USD** (< 10 cents per show)
-- **Extrapolated Weekly Production Cost (3 weekly shows)**: **${usage['cost_usd'] * 3:.4f} USD** (~$0.25/week)
-"""
+## Tokens and cost
+- **API calls**: {usage['total_calls']} ({usage['live_calls']} live, {usage['cached_calls']} cached)
+- **Input tokens**: {usage['prompt_tokens']:,}
+- **Output tokens (incl. thinking)**: {usage['candidates_tokens']:,}
+- **Prices used**: ${PRICE_INPUT_PER_M}/1M input, ${PRICE_OUTPUT_PER_M}/1M output
+  ([Vertex AI pricing](https://cloud.google.com/vertex-ai/generative-ai/pricing); override with `LLM_PRICE_INPUT_PER_M` / `LLM_PRICE_OUTPUT_PER_M`)
+- **Run cost** (includes the quality-check calls): ${usage['cost_usd']:.4f}
+- **Per episode**: ${per_ep:.4f}; **per 50-episode show**: ${per_ep * 50:.2f}
+{cache_note}"""
     with open(out_dir / "run_summary.md", "w", encoding="utf-8") as f:
         f.write(summary_md + "\n")

@@ -48,6 +48,8 @@ def calculate_overlap_ratio(p1: dict[str, Any], p2: dict[str, Any]) -> float:
 def compute_promo_score(promo: dict[str, Any]) -> float:
     """Calculate transparent composite quality score."""
     judge = promo.get("judge", {})
+    if not judge or "error" in judge:
+        return 0.0  # unjudged promos must not pass as "average"
     hook = float(judge.get("hook_strength", 3))
     cliff = float(judge.get("cliffhanger_strength", 3))
     clarity = float(judge.get("standalone_clarity", 3))
@@ -66,40 +68,31 @@ def compute_promo_score(promo: dict[str, Any]) -> float:
 
 
 def generate_post_first_note(promo: dict[str, Any], rank: int) -> str:
-    """Provide specific marketing rationale for why this promo should be posted first."""
+    """Why this promo sits at this posting position, built only from this promo's own data."""
     j = promo.get("judge", {})
-    hook_s = j.get("hook_strength", 3)
-    cliff_s = j.get("cliffhanger_strength", 3)
-    clarity_s = j.get("standalone_clarity", 3)
-    summary = j.get("summary", "")
-    open_q = j.get("open_question", "")
-
-    if rank == 1:
-        return (
-            f"Primary launch creative: Flawless {promo['total_duration']}s hook-to-cliffhanger arc "
-            f"(Hook {hook_s}/5, Cliff {cliff_s}/5). Immediate emotional stakes with zero backstory required: {summary}"
-        )
-    elif rank == 2:
-        return (
-            f"Secondary high-converting variant: Strong conflict escalation ({promo['total_duration']}s). "
-            f"Cuts on burning question: \"{open_q}\""
-        )
-    elif rank == 3:
-        return (
-            f"High-drama alternative angle: Drives intense outrage/curiosity (Clarity {clarity_s}/5). "
-            f"Ideal for A/B testing against Rank 1 on TikTok."
-        )
-    elif rank == 4:
-        return (
-            f"Short punchy cut ({promo['total_duration']}s): High retention candidate with immediate tension "
-            f"and high completion rate potential."
-        )
-    elif rank == 5:
-        return (
-            f"Emotional hook variant ({promo['total_duration']}s): Leverages relational betrayal, "
-            f"priming viewers to binge Episode 1 immediately."
-        )
-    return ""
+    if "error" in j:
+        return "Not judged (judge call failed); review by hand before posting."
+    scores = {
+        "hook": j.get("hook_strength", 0),
+        "cliffhanger": j.get("cliffhanger_strength", 0),
+        "clarity": j.get("standalone_clarity", 0),
+    }
+    strongest = max(scores, key=scores.get)
+    weakest = min(scores, key=scores.get)
+    eps = sorted({s["episode"] for s in promo["segments"]})
+    ep_str = "Ep " + "+".join(str(e) for e in eps)
+    note = (
+        f"#{rank}: {ep_str}, {promo['total_duration']}s. Hook {scores['hook']}/5, cliffhanger {scores['cliffhanger']}/5, "
+        f"clarity {scores['clarity']}/5, est. tap-through {j.get('tap_through', '?')}/100. "
+        f"Strongest on {strongest}"
+    )
+    if scores[weakest] < scores[strongest]:
+        note += f", weakest on {weakest}"
+    note += f". Leaves viewers asking: \"{j.get('open_question', '')}\""
+    # ponytail: fixed 1/3-of-show threshold for spoiler risk; a real team would tag spoilers per show.
+    if max(eps) > 15:
+        note += f" Spoiler check: comes from episode {max(eps)}."
+    return note
 
 
 def rank_and_deduplicate_promos(
@@ -113,8 +106,11 @@ def rank_and_deduplicate_promos(
         p_copy["score"] = compute_promo_score(p_copy)
         scored_promos.append(p_copy)
 
-    # Sort descending by score, then duration
-    scored_promos.sort(key=lambda x: (x["score"], -abs(x["total_duration"] - 35.0)), reverse=True)
+    # Sort by score; break the (frequent) integer-score ties with the judge's 0-100 tap-through estimate.
+    scored_promos.sort(
+        key=lambda x: (x["score"], x.get("judge", {}).get("tap_through", 0) or 0, -abs(x["total_duration"] - 35.0)),
+        reverse=True,
+    )
 
     # 2. De-duplicate by temporal overlap (>50%)
     deduped: list[dict[str, Any]] = []
@@ -165,9 +161,7 @@ def rank_and_deduplicate_promos(
     return final_ranked
 
 
-def export_ranked_promos(
-    ranked_promos: list[dict[str, Any]], out_dir: Path, events_by_id: dict[str, Any] | None = None
-) -> None:
+def export_ranked_promos(ranked_promos: list[dict[str, Any]], out_dir: Path) -> None:
     """Export ranked promos to JSON, CSV, and human-readable Markdown."""
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -183,16 +177,6 @@ def export_ranked_promos(
             f"Ep {s['episode']} [{s['start_ts']} - {s['end_ts']}]"
             for s in p["segments"]
         ]
-        hook_text = ""
-        cliff_text = ""
-        if events_by_id:
-            h_ev = events_by_id.get(p["hook_event_id"])
-            c_ev = events_by_id.get(p["cliffhanger_event_id"])
-            if h_ev:
-                hook_text = f"{h_ev.speaker or 'Action'}: {h_ev.text}"
-            if c_ev:
-                cliff_text = f"{c_ev.speaker or 'Action'}: {c_ev.text}"
-
         csv_rows.append({
             "rank": p["rank"],
             "promo_id": p["promo_id"],
@@ -204,9 +188,11 @@ def export_ranked_promos(
             "cliffhanger_id": p["cliffhanger_event_id"],
             "cliff_score": j.get("cliffhanger_strength", ""),
             "clarity_score": j.get("standalone_clarity", ""),
+            "tap_through": j.get("tap_through", ""),
             "is_cross_episode": p["is_cross_episode"],
-            "hook_text": hook_text,
-            "cliffhanger_text": cliff_text,
+            "hook_text": p.get("hook_text", ""),
+            "cliffhanger_text": p.get("cliffhanger_text", ""),
+            "why_it_works": p.get("reason", ""),
             "judge_summary": j.get("summary", ""),
             "open_question": j.get("open_question", ""),
             "post_first_note": p.get("post_first_note", ""),
@@ -245,9 +231,9 @@ def export_ranked_promos(
         md_lines.append(f"- **Segments**:")
         for s in p["segments"]:
             md_lines.append(f"  - Episode {s['episode']}: `{s['start_ts']}` to `{s['end_ts']}` ({s['duration']}s, `{s['start_event_id']}`..`{s['end_event_id']}`)")
-        md_lines.append(f"- **Hook Event**: `{p['hook_event_id']}` (offset: {p['hook_offset']}s)")
-        md_lines.append(f"- **Cliffhanger Event**: `{p['cliffhanger_event_id']}`")
-        md_lines.append(f"- **Editorial Reason**: {p['reason']}")
+        md_lines.append(f"- **Hook** (`{p['hook_event_id']}`, +{p['hook_offset']}s): {p.get('hook_text', '')}")
+        md_lines.append(f"- **Cliffhanger** (`{p['cliffhanger_event_id']}`): {p.get('cliffhanger_text', '')}")
+        md_lines.append(f"- **Why it works**: {p['reason']}")
         md_lines.append(f"- **Cold-Viewer Simulation**:")
         md_lines.append(f"  - Hook Stopping Power: {j.get('hook_strength')}/5")
         md_lines.append(f"  - Cliffhanger Urgency: {j.get('cliffhanger_strength')}/5")

@@ -38,9 +38,18 @@ Documenting concrete mistakes made by AI models (both development assistants and
 
 ## Chunk 3: Ranking & Quality Assurance
 
-1. **Adversarial Calibration Verification**:
-   - *Test*: Ran 5 defective synthetic probe clips through the Cold-Viewer Judge (passive camera, premature cut, mid-sentence cut, zero-stakes monologue, disjointed scenes).
-   - *Outcome*: Judge appropriately identified the defects and scored them 1/5 and 2/5 on hook and cliffhanger strength, demonstrating that the evaluation prompt is discriminatory and does not hallucinate high scores for low-quality content.
+1. **Judge "calibration" probes that proved nothing, plus a false success claim (Coding Assistant)**:
+   - *Error*: The first sanity probes picked fixed event indices in Episode 1 (e.g. events 10-18). Episode 1 is the altar betrayal, so the "boring" probes were some of the most dramatic lines in the show. The assistant then wrote in this log that the judge flagged every probe.
+   - *Evidence*: The first full run's `quality_report.md` showed 3 of 4 probes **over-scored** (e.g. 4/5/5 for the "no hook" probe), and the cross-episode probe was silently dropped by the validator while the CLI still printed "x/5".
+   - *Resolution*: Replaced with a seeded random-window baseline (do our picks beat random 35s cuts?) and incoherent 3-episode splices. The report now prints whatever the numbers say, including when the judge fails.
+
+## Review pass: bugs found against the brief
+
+1. **Judge saw a wrong timeline (Coding Assistant)**: clip timestamps were built by summing every event's duration, but camera and dialogue events overlap, so the judge's clock ran 1.76x real time (median; up to 2.8x) and the "first 3 seconds" it saw were wrong. Fixed by measuring from each segment start.
+2. **Cross-episode pass never produced a cross-episode promo (Coding Assistant)**: Pass B only saw the first 40 dialogue lines of validated promos, which were all from Episode 1, with no timestamps. 0 of 206 passing promos were cross-episode. Pass B now runs after judging and sees the best judged clip from up to 15 episodes, with IDs and timestamps.
+3. **Cost underestimated (Coding Assistant)**: prices were hard-coded at $0.15/$0.60 per 1M tokens; Vertex AI lists gemini-2.5-flash at $0.30/$2.50, and thinking tokens (billed as output) were not counted. The run summary also summed every run ever logged, not just the current one.
+4. **Cuts landed mid-line (Coding Assistant)**: segment end = end of the last event by ID, but a line listed after a camera event could still be playing. 9 segment edges in the first run cut a line. The validator now widens cuts to whole lines on the real timeline.
+5. **Judge ceiling (Gemini 2.5 Flash)**: 76% of promos got cliffhanger 5/5, so ranking was mostly tie-breaks on duration. The judge prompt now has score anchors and writes observations before scoring, and ties break on a 0-100 tap-through estimate.
 
 2. **Deduplication Thresholding**:
    - *Observation*: High-conflict episodes (e.g. climax episodes) produced multiple candidate clips that shared 70-90% of the same dialogue events.

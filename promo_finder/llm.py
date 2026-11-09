@@ -92,7 +92,7 @@ class LLMClient:
         self.provider = os.getenv("LLM_PROVIDER", "vertex").lower()
         if self.provider == "vertex":
             self.model = os.getenv("LLM_MODEL", "gemini-2.5-flash")
-            self.project = os.getenv("GOOGLE_CLOUD_PROJECT", "project-1e39629d-6865-4364-bc9")
+            self.project = os.getenv("GOOGLE_CLOUD_PROJECT")
             self.location = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
             self.api_key = os.getenv("GEMINI_API_KEY")
             self._init_vertex()
@@ -271,7 +271,10 @@ class LLMClient:
         c_tok = 0
         if hasattr(response, "usage_metadata") and response.usage_metadata:
             p_tok = getattr(response.usage_metadata, "prompt_token_count", 0) or 0
-            c_tok = getattr(response.usage_metadata, "candidates_token_count", 0) or 0
+            # Thinking tokens are billed as output on Gemini 2.5+, so count them with the response tokens.
+            c_tok = (getattr(response.usage_metadata, "candidates_token_count", 0) or 0) + (
+                getattr(response.usage_metadata, "thoughts_token_count", 0) or 0
+            )
 
         return parsed, p_tok, c_tok
 
@@ -290,6 +293,12 @@ class LLMClient:
         messages: list[dict[str, str]] = []
         if system_instruction:
             messages.append({"role": "system", "content": system_instruction})
+        if schema:
+            # json_object mode does not take a schema, so spell out the expected shape in the prompt.
+            prompt += (
+                "\n\nRespond with ONLY a JSON object matching this schema "
+                "(types are uppercase OpenAPI names):\n" + json.dumps(schema)
+            )
         messages.append({"role": "user", "content": prompt})
 
         payload: dict[str, Any] = {
@@ -305,7 +314,7 @@ class LLMClient:
             headers=headers,
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=180) as resp:
             data = json.loads(resp.read().decode("utf-8"))
 
         content = data["choices"][0]["message"]["content"]
@@ -320,13 +329,23 @@ class LLMClient:
 
 # Module-level singleton
 _default_client: LLMClient | None = None
+_default_client_env: tuple[str, str | None, str | None] | None = None
 
 
 def get_llm_client() -> LLMClient:
-    global _default_client
-    if _default_client is None:
+    """Return the shared client, rebuilding it if LLM_PROVIDER / LLM_MODEL changed (e.g. from the UI)."""
+    global _default_client, _default_client_env
+    env = (os.getenv("LLM_PROVIDER", "vertex").lower(), os.getenv("LLM_MODEL"), os.getenv("LLM_BASE_URL"))
+    if _default_client is None or env != _default_client_env:
         _default_client = LLMClient()
+        _default_client_env = env
     return _default_client
+
+
+def set_usage_log_path(path: str | Path) -> None:
+    """Send usage records to a per-run file so cost numbers cover this run only."""
+    global USAGE_LOG_PATH
+    USAGE_LOG_PATH = Path(path)
 
 
 def generate_json(
